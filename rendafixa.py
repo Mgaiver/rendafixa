@@ -8,169 +8,181 @@ from datetime import datetime
 # --- Configurações da Página e Funções ---
 st.set_page_config(layout="wide")
 
+# --- MUDANÇA CRÍTICA: Dicionário de Harmonização de Colunas ---
+# Mapeia todos os nomes de colunas possíveis para um nome PADRÃO.
+# Edite aqui se seus arquivos tiverem nomes diferentes no futuro.
+COLUMN_MAPPING = {
+    # Nomes possíveis -> Nome Padrão
+    'Ativo': 'Ativo',
+    'Vencimento': 'Vencimento',
+    'Tax.Máx': 'Taxa Máxima',
+    'Tax.Mín': 'Taxa Mínima',
+    'Taxa Min/Máx': 'Taxa Contratada',
+    'GrossUp Tax.Máx': 'GrossUp Máximo',
+    'GrossUp Tax.Mín': 'GrossUp Mínimo',
+    'Gross Up': 'Gross Up',
+    'P.U': 'Preço Unitário',
+    'Qtd. Disp.': 'Qtd Disponível',
+    'Rating': 'Rating',
+    'ROA Escritório': 'ROA',
+    'ROA E. Aprox.': 'ROA',
+    'Risco': 'Risco',
+    'Público Alvo': 'Público Alvo',
+    'Público': 'Público Alvo',
+    'Isento': 'Isento IR',
+    'Incentivada': 'Isento IR',
+    'Emissor': 'Emissor',
+    'Indexador': 'Indexador',
+    'Ticker': 'Ticker'
+}
+
+def formatar_prazo_humanizado(dias):
+    """Converte dias para um formato de texto legível."""
+    if pd.isna(dias) or dias < 0: return "N/A"
+    if dias == 0: return "Hoje"
+    anos, dias_rest = divmod(int(dias), 365)
+    meses, dias_finais = divmod(dias_rest, 30)
+    partes = []
+    if anos > 0: partes.append(f"{anos} ano{'s' if anos > 1 else ''}")
+    if meses > 0: partes.append(f"{meses} {'meses' if meses > 1 else 'mês'}")
+    if dias_finais > 0: partes.append(f"{dias_finais} dia{'s' if dias_finais > 1 else ''}")
+    return ", ".join(partes) if partes else "Menos de 1 mês"
+
 @st.cache_data
-def load_and_process_data(uploaded_file):
-    """Carrega o arquivo excel e aplica a limpeza e engenharia de features iniciais."""
-    df = pd.read_excel(uploaded_file, sheet_name='Resultado')
+def load_and_consolidate_data(uploaded_files):
+    """Carrega, identifica, harmoniza e consolida múltiplos arquivos Excel."""
+    all_dfs = []
 
-    def clean_columns(df):
-        if 'Tax.Máx' in df.columns:
-            df['Tax.Máx'] = (
-                df['Tax.Máx'].astype(str)
-                .str.replace('% CDI', '', regex=False).str.replace(',', '.')
-                .str.extract(r'(\d+\.?\d*)')[0].astype(float)
-            )
-        if 'ROA E. Aprox.' in df.columns:
-            df['ROA E. Aprox.'] = (
-                df['ROA E. Aprox.'].astype(str)
-                .str.replace('%', '', regex=False).str.replace(',', '.')
-                .str.extract(r'(\d+\.?\d*)')[0].astype(float)
-            )
+    def get_asset_type(filename):
+        fn = filename.lower()
+        if 'bancaria' in fn: return 'Emissão Bancária'
+        if 'privado' in fn: return 'Crédito Privado'
+        if 'publico' in fn: return 'Títulos Públicos'
+        if 'financeira' in fn: return 'Letras Financeiras'
+        return 'Outros'
+
+    for file in uploaded_files:
+        df = pd.read_excel(file)
+        df['Tipo de Ativo'] = get_asset_type(file.name)
+        df.rename(columns=COLUMN_MAPPING, inplace=True)
+        all_dfs.append(df)
+    
+    if not all_dfs: return pd.DataFrame()
+
+    master_df = pd.concat(all_dfs, ignore_index=True)
+
+    # Limpeza e Feature Engineering no DataFrame consolidado
+    if 'ROA' in master_df.columns:
+        master_df['ROA_num'] = pd.to_numeric(
+            master_df['ROA'].astype(str).str.replace(',', '.').str.extract(r'(\d+\.?\d*)')[0],
+            errors='coerce'
+        )
+    # Garante que a Taxa Máxima seja numérica para o gráfico
+    if 'Taxa Máxima' in master_df.columns:
+         master_df['Taxa Máxima_num'] = pd.to_numeric(master_df['Taxa Máxima'], errors='coerce')
+
+
+    if 'Vencimento' in master_df.columns:
+        master_df['Vencimento'] = pd.to_datetime(master_df['Vencimento'], errors='coerce')
+        master_df['Vencimento Formatado'] = master_df['Vencimento'].dt.strftime('%d/%m/%Y')
         
-        required_cols = ['Tax.Máx', 'ROA E. Aprox.', 'Vencimento']
-        existing_required_cols = [col for col in required_cols if col in df.columns]
-        return df.dropna(subset=existing_required_cols)
+        def calcular_prazo_carencia(row):
+            hoje = datetime.now().date()
+            if pd.isna(row['Vencimento']): return np.nan
+            return max((row['Vencimento'].date() - hoje).days, 0)
+            
+        master_df['Prazo Carência (dias)'] = master_df.apply(calcular_prazo_carencia, axis=1)
+        master_df['Prazo'] = master_df['Prazo Carência (dias)'].apply(formatar_prazo_humanizado)
 
-    df = clean_columns(df)
-
-    def calcular_prazo_carencia(row):
-        hoje = datetime.now().date()
-        try:
-            venc = pd.to_datetime(row['Vencimento']).date()
-        except:
-            return np.nan
-        carencia = str(row.get('Carência', '')).strip().lower()
-        if carencia in ['nan', '', 'vencimento', 'no vencimento']:
-            prazo = (venc - hoje).days
-        else:
-            try:
-                prazo_num = int(''.join(filter(str.isdigit, carencia)))
-                prazo = prazo_num
-            except:
-                prazo = (venc - hoje).days
-        return max(prazo, 0)
-
-    if 'Vencimento' in df.columns:
-        df['Prazo Carência (dias)'] = df.apply(calcular_prazo_carencia, axis=1)
-        df.dropna(subset=['Prazo Carência (dias)'], inplace=True)
-        df['Prazo Carência (dias)'] = df['Prazo Carência (dias)'].astype(int)
-
-    return df
+    return master_df
 
 def create_plot(df_filtered):
-    """Cria o gráfico de dispersão com base no dataframe filtrado."""
-    if df_filtered.empty or 'Tax.Máx' not in df_filtered.columns or 'ROA E. Aprox.' not in df_filtered.columns:
+    """Cria o gráfico de dispersão Risco (ROA) vs. Retorno (Taxa)."""
+    plot_cols = ['Taxa Máxima_num', 'ROA_num', 'Prazo Carência (dias)']
+    if df_filtered.empty or not all(c in df_filtered.columns for c in plot_cols):
         return None, pd.DataFrame()
 
-    tax_min, tax_max = df_filtered['Tax.Máx'].min(), df_filtered['Tax.Máx'].max()
-    roa_min, roa_max = df_filtered['ROA E. Aprox.'].min(), df_filtered['ROA E. Aprox.'].max()
-    
-    df_filtered['Taxa_norm'] = 0.5 if (tax_max - tax_min) == 0 else (df_filtered['Tax.Máx'] - tax_min) / (tax_max - tax_min)
-    df_filtered['ROA_norm'] = 0.5 if (roa_max - roa_min) == 0 else (df_filtered['ROA E. Aprox.'] - roa_min) / (roa_max - roa_min)
-    df_filtered['Score'] = df_filtered['Taxa_norm'] + df_filtered['ROA_norm']
+    df_plot = df_filtered.dropna(subset=plot_cols)
+    if df_plot.empty: return None, pd.DataFrame()
 
-    ## CORREÇÃO 1: GRÁFICO - Ajustado o tamanho da figura para uma melhor proporção (mais largo)
+    # Score normalizado usando Taxa e ROA
+    tax_range = df_plot['Taxa Máxima_num'].max() - df_plot['Taxa Máxima_num'].min()
+    roa_range = df_plot['ROA_num'].max() - df_plot['ROA_num'].min()
+    df_plot['Taxa_norm'] = 0.5 if tax_range == 0 else (df_plot['Taxa Máxima_num'] - df_plot['Taxa Máxima_num'].min()) / tax_range
+    df_plot['ROA_norm'] = 0.5 if roa_range == 0 else (df_plot['ROA_num'] - df_plot['ROA_num'].min()) / roa_range
+    df_plot['Score'] = df_plot['Taxa_norm'] + df_plot['ROA_norm']
+    
+    top3 = df_plot.sort_values('Score', ascending=False).head(3)
+
     fig, ax = plt.subplots(figsize=(12, 7))
+    sns.kdeplot(x=df_plot['Taxa Máxima_num'], y=df_plot['ROA_num'], cmap="YlOrRd", fill=True, thresh=0.05, alpha=0.3, ax=ax)
+    scatter = ax.scatter(x=df_plot['Taxa Máxima_num'], y=df_plot['ROA_num'], c=df_plot['Prazo Carência (dias)'], cmap='RdYlGn_r', s=90, edgecolor='k', alpha=0.85)
     
-    sns.kdeplot(
-        x=df_filtered['Tax.Máx'], y=df_filtered['ROA E. Aprox.'],
-        cmap="YlOrRd", fill=True, thresh=0.05, levels=100, alpha=0.3, ax=ax
-    )
-    norm = plt.Normalize(df_filtered['Prazo Carência (dias)'].min(), df_filtered['Prazo Carência (dias)'].max())
-    scatter = ax.scatter(
-        df_filtered['Tax.Máx'], df_filtered['ROA E. Aprox.'],
-        c=df_filtered['Prazo Carência (dias)'], cmap='RdYlGn_r', s=90, edgecolor='k', alpha=0.85, norm=norm
-    )
-    
-    top3 = df_filtered.sort_values('Score', ascending=False).head(3)
     if 'Ativo' in top3.columns:
-        # Calcula um pequeno deslocamento para o texto não ficar sobre o ponto
-        x_offset = (tax_max - tax_min) * 0.01 
         for _, row in top3.iterrows():
-            ## CORREÇÃO 2: GRÁFICO - Texto deslocado para a direita para não cobrir a estrela
-            ax.text(row['Tax.Máx'] + x_offset, row['ROA E. Aprox.'], f" {row['Ativo']}", 
-                    fontsize=9, weight='bold', color='navy', va='center')
-            ax.scatter(row['Tax.Máx'], row['ROA E. Aprox.'], c='blue', s=200, marker='*', label='Top 3 Ativos', zorder=5)
+            ax.text(row['Taxa Máxima_num'], row['ROA_num'], f" {row['Ativo']}", fontsize=9, weight='bold', color='navy', va='bottom')
+            ax.scatter(row['Taxa Máxima_num'], row['ROA_num'], c='blue', s=200, marker='*', label='Top 3 Ativos', zorder=5)
 
-    ax.set_xlabel('Taxa Máxima (% CDI)')
-    ax.set_ylabel('ROA Estimada Anual (%)')
-    ax.set_title('Mapa de Oportunidades em Renda Fixa', fontsize=16)
-    fig.colorbar(scatter, ax=ax, label='Prazo de Carência (dias)')
-    ax.grid(True, which='both', linestyle='--', linewidth=0.5)
-    
-    handles, labels = ax.get_legend_handles_labels()
-    by_label = dict(zip(labels, handles))
-    if by_label:
-        ax.legend(by_label.values(), by_label.keys())
-    
+    ax.set_xlabel('Taxa Máxima Contratada'); ax.set_ylabel('ROA (%)')
+    ax.set_title('Análise Consolidada: Risco (ROA) vs. Retorno (Taxa)', fontsize=16)
+    fig.colorbar(scatter, ax=ax, label='Prazo de Carência (dias)'); ax.grid(True, which='both', linestyle='--', linewidth=0.5)
+    handles, labels = ax.get_legend_handles_labels(); by_label = dict(zip(labels, handles))
+    if by_label: ax.legend(by_label.values(), by_label.keys())
     plt.tight_layout()
-    
     return fig, top3
 
 # --- Interface do Aplicativo ---
-st.title('Analisador Interativo de Renda Fixa 📊')
-st.write("Esta ferramenta ajuda a visualizar as melhores oportunidades em ativos de renda fixa, cruzando a **Taxa Máxima** com o **ROA (Retorno sobre Ativos)** da instituição.")
+st.title('Analisador Consolidado de Renda Fixa 📊')
+st.write("Carregue múltiplos arquivos (Crédito Privado, Bancário, etc.) para analisar todo o universo de oportunidades em um só lugar.")
 
-st.sidebar.header('1. Carregue seus dados')
-uploaded_file = st.sidebar.file_uploader("Escolha o arquivo Excel", type="xlsx")
+st.sidebar.header('1. Carregue os Arquivos')
+uploaded_files = st.sidebar.file_uploader(
+    "Pode selecionar vários arquivos de uma vez",
+    type=["xlsx", "xls"],
+    accept_multiple_files=True
+)
 
-if uploaded_file is None:
-    st.info("Por favor, carregue um arquivo Excel para começar.")
-    st.stop()
+if not uploaded_files:
+    st.info("Por favor, carregue um ou mais arquivos Excel para começar."); st.stop()
 
-df_original = load_and_process_data(uploaded_file)
-df = df_original.copy()
+df_master = load_and_consolidate_data(uploaded_files)
+df_filtered = df_master.copy()
 
+# --- Filtros (Sidebar) ---
 st.sidebar.header('2. Filtre as Oportunidades')
 with st.sidebar.expander("ℹ️ Como Usar o Aplicativo"):
-    st.markdown(
-        """
-        1. **Carregue seus dados:** Use o botão acima.
-        2. **Filtre as oportunidades:** Use os controles abaixo para refinar sua busca.
-        3. **Analise os resultados:** O gráfico mostra a relação Risco vs. Retorno. A cor indica o prazo e os Top 3 são destacados com uma ⭐.
-        """
-    )
+    st.markdown("Use os filtros para refinar sua busca. O gráfico e as tabelas serão atualizados automaticamente.")
 
-if 'Prazo Carência (dias)' in df.columns:
-    min_prazo = df['Prazo Carência (dias)'].min()
-    max_prazo = df['Prazo Carência (dias)'].max()
-    selected_prazo = st.sidebar.slider(
-        'Prazo de Carência (dias)',
-        min_value=min_prazo, max_value=max_prazo, value=(min_prazo, max_prazo)
-    )
-    df_filtered = df[df['Prazo Carência (dias)'].between(selected_prazo[0], selected_prazo[1])]
-else:
-    df_filtered = df.copy()
+asset_types = sorted(df_filtered['Tipo de Ativo'].unique())
+selected_types = st.sidebar.multiselect('Tipo de Ativo', options=asset_types, default=asset_types)
+df_filtered = df_filtered[df_filtered['Tipo de Ativo'].isin(selected_types)]
 
-if 'Indexador' in df_filtered.columns:
-    indexadores_disponiveis = df_filtered['Indexador'].unique()
-    selected_indexador = st.sidebar.multiselect(
-        'Indexador do Ativo',
-        options=indexadores_disponiveis, default=indexadores_disponiveis
-    )
-    df_filtered = df_filtered[df_filtered['Indexador'].isin(selected_indexador)]
+if 'Prazo Carência (dias)' in df_filtered.columns and not df_filtered.empty:
+    min_p, max_p = int(df_filtered['Prazo Carência (dias)'].min()), int(df_filtered['Prazo Carência (dias)'].max())
+    sel_prazo = st.sidebar.slider('Prazo de Carência (dias)', min_p, max_p, (min_p, max_p))
+    df_filtered = df_filtered[df_filtered['Prazo Carência (dias)'].between(sel_prazo[0], sel_prazo[1])]
 
+if 'Indexador' in df_filtered.columns and not df_filtered.empty:
+    indexadores = sorted(df_filtered['Indexador'].dropna().unique())
+    sel_index = st.sidebar.multiselect('Indexador', options=indexadores, default=indexadores)
+    df_filtered = df_filtered[df_filtered['Indexador'].isin(sel_index)]
+
+# --- Exibição dos Resultados ---
 st.header('Resultados Filtrados')
 if df_filtered.empty:
     st.warning("Nenhum ativo encontrado com os filtros selecionados.")
 else:
     fig, top3 = create_plot(df_filtered)
-    
     if fig:
         st.pyplot(fig)
 
-        ## CORREÇÃO 3: TABELAS - Lógica que previne o KeyError
-        cols_to_display = ['Ativo', 'Tax.Máx', 'ROA E. Aprox.', 'Prazo Carência (dias)', 'Vencimento', 'Indexador', 'Emissor']
-        
-        available_cols_top3 = [col for col in cols_to_display if col in top3.columns]
-        available_cols_all = [col for col in cols_to_display if col in df_filtered.columns]
+    # Nomes de coluna padronizados para exibição
+    cols_to_display = [
+        'Ativo', 'Tipo de Ativo', 'Vencimento Formatado', 'Prazo', 'Taxa Contratada', 'Taxa Mínima', 'Taxa Máxima',
+        'Gross Up', 'Preço Unitário', 'Qtd Disponível', 'Rating', 'ROA', 'Risco', 
+        'Público Alvo', 'Isento IR', 'Emissor', 'Indexador', 'Ticker'
+    ]
+    available_cols = [col for col in cols_to_display if col in df_filtered.columns]
 
-        if not top3.empty and available_cols_top3:
-            st.subheader('⭐ Top 3 Oportunidades Filtradas')
-            st.dataframe(top3[available_cols_top3])
-
-        if available_cols_all:
-            st.subheader('Todos os Dados Filtrados')
-            st.dataframe(df_filtered[available_cols_all])
-    else:
-        st.warning("Não foi possível gerar o gráfico com os dados filtrados.")
+    st.subheader(f'Total de {len(df_filtered)} Ativos Encontrados')
+    st.dataframe(df_filtered[available_cols])
